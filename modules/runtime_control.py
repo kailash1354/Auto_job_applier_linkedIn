@@ -37,6 +37,15 @@ def default_state(token: str = "") -> dict:
     }
 
 
+def resolve_search_terms(configured_terms, settings) -> list[str]:
+    """Use a transient single-term override only when the user explicitly set one."""
+    settings = settings if isinstance(settings, dict) else {}
+    override = str(settings.get("search_term") or "").strip()
+    if override:
+        return [override]
+    return [str(term).strip() for term in (configured_terms or []) if str(term).strip()]
+
+
 def read_state() -> dict:
     with _lock:
         try:

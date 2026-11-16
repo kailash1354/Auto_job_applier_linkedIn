@@ -1767,7 +1767,10 @@ def run(total_runs: int) -> int:
     print_lg(f"Date and Time: {datetime.now()}")
     print_lg(f"Cycle number: {total_runs}")
     print_lg(f"Currently looking for jobs posted within '{date_posted}' and sorting them by '{sort_by}'")
-    apply_to_jobs(search_terms)
+    runtime_settings = runtime_control.read_state().get("settings") or {}
+    _apply_runtime_settings(runtime_settings)
+    selected_search_terms = runtime_control.resolve_search_terms(search_terms, runtime_settings)
+    apply_to_jobs(selected_search_terms)
     print_lg("########################################################################################################################\n")
     # Only wait between cycles when there is actually going to be another cycle. This used
     # to run at the end of every single run, which reads as a 10 minute hang.

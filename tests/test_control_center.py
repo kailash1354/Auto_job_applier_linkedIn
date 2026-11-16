@@ -58,3 +58,13 @@ def test_analytics_uses_existing_history_csv(monkeypatch, tmp_path):
     assert response.get_json()["total"] == 2
     assert response.get_json()["easy_applied"] == 1
     assert response.get_json()["pending"] == 1
+
+
+def test_search_terms_keep_all_configured_roles_without_runtime_override():
+    configured = ["Software Engineer", "Python Developer", "Data Scientist"]
+    assert runtime_control.resolve_search_terms(configured, {"search_term": ""}) == configured
+
+
+def test_explicit_runtime_search_term_overrides_configured_roles():
+    configured = ["Software Engineer", "Python Developer"]
+    assert runtime_control.resolve_search_terms(configured, {"search_term": "Notetaker"}) == ["Notetaker"]
