@@ -351,6 +351,7 @@ def wait_for_bot_control() -> None:
 def _apply_runtime_settings(settings: dict) -> None:
     """Apply only safe transient settings; persistent config remains unchanged."""
     global search_location, easy_apply_only, use_AI, active_search_term
+    global salary, desired_salary, desired_salary_lakhs, desired_salary_monthly
     if str(settings.get("search_term") or "").strip():
         active_search_term = str(settings["search_term"]).strip()
     if settings.get("location"):
@@ -359,6 +360,17 @@ def _apply_runtime_settings(settings: dict) -> None:
         easy_apply_only = settings["easy_apply_only"]
     if isinstance(settings.get("use_ai"), bool):
         use_AI = settings["use_ai"]
+    if "salary" in settings and settings["salary"] is not None:
+        salary = str(settings["salary"]).strip()
+    if "desired_salary" in settings and settings["desired_salary"] is not None:
+        try:
+            numeric_salary = float(settings["desired_salary"])
+            if numeric_salary >= 0:
+                desired_salary = str(int(numeric_salary) if numeric_salary.is_integer() else numeric_salary)
+                desired_salary_lakhs = str(round(numeric_salary / 100000, 2))
+                desired_salary_monthly = str(round(numeric_salary / 12, 2))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid live desired_salary value: %r", settings["desired_salary"])
 
 
 def recommended_filter_wait(gap: int) -> int:

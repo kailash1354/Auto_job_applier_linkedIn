@@ -68,3 +68,49 @@ def test_search_terms_keep_all_configured_roles_without_runtime_override():
 def test_explicit_runtime_search_term_overrides_configured_roles():
     configured = ["Software Engineer", "Python Developer"]
     assert runtime_control.resolve_search_terms(configured, {"search_term": "Notetaker"}) == ["Notetaker"]
+
+
+def test_runtime_search_terms_override_configured_role_list():
+    configured = ["Software Engineer", "Python Developer"]
+    settings = {"search_terms": ["Full Stack Developer", "React Developer"]}
+    assert runtime_control.resolve_search_terms(configured, settings) == settings["search_terms"]
+
+
+def test_runtime_api_accepts_live_salary_controls(monkeypatch, tmp_path):
+    _isolated_state(monkeypatch, tmp_path)
+    runtime_control.start_run("salary-token")
+    client = app.app.test_client()
+
+    response = client.post(
+        "/api/runtime",
+        headers={"X-Bot-Control-Token": "salary-token"},
+        json={"settings": {
+            "search_terms": ["Full Stack Developer"],
+            "salary": "$60,000+",
+            "desired_salary": 500000,
+        }},
+    )
+
+    assert response.status_code == 200
+    settings = response.get_json()["settings"]
+    assert settings["search_terms"] == ["Full Stack Developer"]
+    assert settings["salary"] == "$60,000+"
+    assert settings["desired_salary"] == 500000
+
+
+def test_config_save_projects_role_and_salary_to_live_runtime(monkeypatch, tmp_path):
+    _isolated_state(monkeypatch, tmp_path)
+    runtime_control.start_run("config-token")
+    monkeypatch.setattr(app, "USER_CONFIG_PATH", str(tmp_path / "user_config.json"))
+    client = app.app.test_client()
+
+    response = client.post("/api/config", json={
+        "search": {"search_terms": ["Full Stack Developer"], "salary": "$60,000+"},
+        "questions": {"desired_salary": 500000},
+    })
+
+    assert response.status_code == 200
+    settings = runtime_control.read_state()["settings"]
+    assert settings["search_terms"] == ["Full Stack Developer"]
+    assert settings["salary"] == "$60,000+"
+    assert settings["desired_salary"] == 500000

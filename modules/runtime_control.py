@@ -29,7 +29,10 @@ def default_state(token: str = "") -> dict:
         "updated_at": time.time(),
         "settings": {
             "search_term": "",
+            "search_terms": [],
             "location": "",
+            "salary": "",
+            "desired_salary": None,
             "easy_apply_only": None,
             "timing_profile": "balanced",
             "use_ai": None,
@@ -43,6 +46,11 @@ def resolve_search_terms(configured_terms, settings) -> list[str]:
     override = str(settings.get("search_term") or "").strip()
     if override:
         return [override]
+    live_terms = settings.get("search_terms")
+    if isinstance(live_terms, list):
+        cleaned = [str(term).strip() for term in live_terms if str(term).strip()]
+        if cleaned:
+            return cleaned
     return [str(term).strip() for term in (configured_terms or []) if str(term).strip()]
 
 

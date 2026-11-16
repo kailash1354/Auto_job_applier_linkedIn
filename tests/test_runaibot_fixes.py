@@ -98,6 +98,20 @@ def test_text_question_is_typed_through_human_type(bot, monkeypatch):
     assert typed == [(text_input, bot.first_name)]
 
 
+def test_live_role_and_salary_settings_reach_automation_globals(bot):
+    bot._apply_runtime_settings({
+        "search_term": "Full Stack Developer",
+        "salary": "$60,000+",
+        "desired_salary": 500000,
+    })
+
+    assert bot.active_search_term == "Full Stack Developer"
+    assert bot.salary == "$60,000+"
+    assert bot.desired_salary == "500000"
+    assert bot.desired_salary_lakhs == "5.0"
+    assert bot.desired_salary_monthly == "41666.67"
+
+
 # ------------------------------ K: whole-word bad words ----------------------------
 @pytest.mark.parametrize("text, words, expected", [
     ("Senior JavaScript Engineer", ["java"], None),          # the #95 bug: java != javascript

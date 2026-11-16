@@ -403,6 +403,19 @@ def api_save_config():
     except OSError as err:
         return jsonify({"error": f"Could not save settings: {err}"}), 500
 
+    # The bot imports config/*.py at process start. Mirror safe live fields into
+    # the shared runtime so a paused running bot observes panel edits too.
+    live_settings = {}
+    if "search" in coerced:
+        if "search_terms" in coerced["search"]:
+            live_settings["search_terms"] = coerced["search"]["search_terms"]
+        if "salary" in coerced["search"]:
+            live_settings["salary"] = coerced["search"]["salary"]
+    if "questions" in coerced and "desired_salary" in coerced["questions"]:
+        live_settings["desired_salary"] = coerced["questions"]["desired_salary"]
+    if live_settings:
+        runtime_control.update_state(settings=live_settings)
+
     return jsonify(current)
 
 
@@ -506,7 +519,10 @@ def api_runtime_update():
         settings = payload["settings"]
         if not isinstance(settings, dict):
             return jsonify({"error": "settings must be an object"}), 400
-        allowed_settings = {"search_term", "location", "easy_apply_only", "timing_profile", "use_ai"}
+        allowed_settings = {
+            "search_term", "search_terms", "location", "salary", "desired_salary",
+            "easy_apply_only", "timing_profile", "use_ai",
+        }
         changes["settings"] = {key: value for key, value in settings.items() if key in allowed_settings}
     if not changes:
         return jsonify({"error": "No supported runtime changes supplied"}), 400
