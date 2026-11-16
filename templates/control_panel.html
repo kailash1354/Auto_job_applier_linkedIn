@@ -432,7 +432,9 @@
             updateModelLists();
             applyAiState();
 
-            showTab(SCHEMA.length ? SCHEMA[0].section : 'Run');
+            var requestedTab = new URLSearchParams(window.location.search).get('tab');
+            var availableTabs = SCHEMA.map(function (section) { return section.section; }).concat(['Run']);
+            showTab(availableTabs.indexOf(requestedTab) >= 0 ? requestedTab : (SCHEMA.length ? SCHEMA[0].section : 'Run'));
         }
 
         function showTab(name) {
@@ -515,6 +517,17 @@
                 text: 'Tip: save your settings on the other tabs before starting.' }));
             panel.appendChild(runbox);
 
+            var live = el('div', { class: 'field' });
+            live.appendChild(el('h2', { class: 'section-h', text: 'Live controls' }));
+            live.appendChild(el('p', { class: 'muted-small', text: 'Changes here affect the current run only unless you save them in the settings tabs.' }));
+            var liveActions = el('div', { class: 'run-actions' });
+            [['livePause','Pause', 'secondary'], ['liveResume','Resume', 'secondary'], ['liveRefresh','Refresh search', 'secondary']].forEach(function (item) {
+                var b = el('button', { class: 'btn ' + item[2], id: item[0], type: 'button', text: item[1] });
+                liveActions.appendChild(b);
+            });
+            var liveLocation = el('input', { type: 'text', id: 'liveLocation', placeholder: 'Change location while paused' });
+            live.appendChild(liveActions); live.appendChild(liveLocation); panel.appendChild(live);
+
             panel.appendChild(el('h2', { class: 'section-h', text: 'Activity log' }));
             panel.appendChild(el('pre', { class: 'log', id: 'logPane', text: 'No activity yet.' }));
 
@@ -552,8 +565,20 @@
 
         function refreshStatus() {
             fetch('/api/status').then(function (r) { return r.json(); })
-                .then(function (s) { setRunningUI(s.running, s.pid); })
+                .then(function (s) { setRunningUI(s.running, s.pid); updateRuntimeUI(s.runtime || {}); })
                 .catch(function () {});
+        }
+
+        function runtimeChange(change) {
+            return fetch('/api/runtime', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(change) })
+                .then(function (r) { return r.json(); }).then(function (state) { updateRuntimeUI(state); return state; });
+        }
+
+        function updateRuntimeUI(state) {
+            var liveLocation = document.getElementById('liveLocation');
+            if (liveLocation && state.settings && document.activeElement !== liveLocation) liveLocation.value = state.settings.location || '';
+            var runtimeText = document.getElementById('statusText');
+            if (runtimeText && state.status === 'stopping') runtimeText.textContent = 'Stopping...';
         }
 
         function refreshLogs() {
@@ -592,6 +617,15 @@
                 .then(function (s) { setRunningUI(s.running, s.pid); })
                 .catch(function () {});
         }
+
+        document.addEventListener('click', function (event) {
+            if (event.target.id === 'livePause') runtimeChange({paused:true});
+            if (event.target.id === 'liveResume') runtimeChange({paused:false, refresh:false});
+            if (event.target.id === 'liveRefresh') runtimeChange({paused:true, refresh:true});
+        });
+        document.addEventListener('change', function (event) {
+            if (event.target.id === 'liveLocation') runtimeChange({settings:{location:event.target.value}});
+        });
 
         function pollLoop() {
             if (activeTab === 'Run') { refreshStatus(); refreshLogs(); }

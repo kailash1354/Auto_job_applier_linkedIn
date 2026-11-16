@@ -27,6 +27,8 @@ Public interface (used by runAiBot.py):
 from __future__ import annotations
 
 import os
+import queue
+import threading
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -39,6 +41,14 @@ import config.secrets as cfg
 from config.settings import showAiErrorAlerts
 from modules.helpers import print_lg, critical_error_log, logger, convert_to_json
 from modules.ai.prompts import extract_skills_prompt, ai_answer_prompt
+
+
+# Per-process cache: identical required questions across similar Easy Apply forms
+# should consume one provider request, not one request per listing.
+_answer_cache: dict[tuple[str, tuple[str, ...], str], str] = {}
+# A provider outage must not turn every unresolved application field into a
+# repeated network wait.  This is process-local and clears on the next bot run.
+_provider_unavailable = False
 
 try:
     from pyautogui import confirm
@@ -120,7 +130,11 @@ def create_ai_client() -> Optional[AIClient]:
         api_key = (getattr(cfg, "llm_api_key", "") or "").strip()
         temperature = getattr(cfg, "llm_temperature", None)
 
-        kwargs = {}
+        # LangChain's provider defaults retry rate-limit responses several
+        # times.  That is useful for transient failures, but harmful here:
+        # one exhausted quota can stall the whole job loop.  The application
+        # layer already has bounded fallback behavior, so fail fast instead.
+        kwargs = {"max_retries": 0}
         # Some newer models only accept their default temperature; leave it unset unless the user opts in.
         if temperature is not None:
             kwargs["temperature"] = temperature
@@ -247,7 +261,7 @@ def _build_answer_graph(model):
         for opt in options:                       # substring (either direction)
             if opt.lower() in low or low in opt.lower():
                 return {"answer": opt}
-        return {"answer": raw}
+        return {"answer": ""}
 
     def route(state: _AnswerState) -> str:
         return "select" if state.get("question_type") in ("single_select", "multiple_select") else "text"
@@ -279,20 +293,58 @@ def answer_question(
     Generate an answer to a single application-form question.
     Returns the answer string, or "" if AI is unavailable or the call fails.
     '''
-    if not client or not question:
+    global _provider_unavailable
+    if not client or not question or _provider_unavailable:
         return ""
+    key = (
+        " ".join(question.casefold().split()),
+        tuple(" ".join(str(option).casefold().split()) for option in (options or [])),
+        question_type,
+    )
+    if key in _answer_cache:
+        return _answer_cache[key]
     try:
-        final = client.answer_graph.invoke({
+        payload = {
             "question": question,
             "options": options,
             "question_type": question_type,
             "job_description": job_description,
             "about_company": about_company,
             "user_information": user_information_all,
-        })
+        }
+        result_queue: queue.Queue = queue.Queue(maxsize=1)
+
+        def invoke() -> None:
+            try:
+                result_queue.put((True, client.answer_graph.invoke(payload)))
+            except Exception as error:
+                result_queue.put((False, error))
+
+        # Google's SDK has its own retry policy which can outlive LangChain's
+        # setting.  A daemon worker keeps a quota/provider outage from freezing
+        # the Selenium job loop; unresolved required fields are then skipped.
+        threading.Thread(target=invoke, daemon=True, name="ai-answer",).start()
+        try:
+            ok, result = result_queue.get(timeout=float(os.getenv("BOT_AI_TIMEOUT_SECONDS", "8")))
+        except queue.Empty as error:
+            _provider_unavailable = True
+            raise TimeoutError("AI answer timed out") from error
+        if not ok:
+            raise result
+        final = result
         answer = final.get("answer", "") or ""
         print_lg(f'AI answered "{question}" -> "{answer}"')
+        _answer_cache[key] = answer
         return answer
     except Exception as e:
+        message = str(e).lower()
+        if any(marker in message for marker in ("429", "quota", "resource_exhausted", "rate limit", "too many requests")):
+            _provider_unavailable = True
         _ai_error_alert("Could not generate an AI answer for a question.", e)
+        _answer_cache[key] = ""
+        try:
+            from modules import runtime_control
+            runtime_control.update_state(last_error=f"AI answer unavailable: {type(e).__name__}")
+        except Exception:
+            pass
         return ""

@@ -100,11 +100,11 @@ def test_answer_question_select_snaps_to_allowed_option():
     assert answer == "Yes"
 
 
-def test_answer_question_select_passthrough_when_no_option_matches():
+def test_answer_question_select_rejects_when_no_option_matches():
     client = C.AIClient(_StubModel("Maybe later"))
     answer = C.answer_question(client, "Pick one", options=["Alpha", "Beta"],
                              question_type="single_select")
-    assert answer == "Maybe later"
+    assert answer == ""
 
 
 def test_answer_question_none_client_is_safe():

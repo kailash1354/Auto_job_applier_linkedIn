@@ -22,3 +22,7 @@ apikeys.py
 user_config.json
 .bot_run.log
 .bot_run.pid
+.bot_runtime.json
+.bot_server.log
+chrome_profile/
+chrome_profile.previous-*/

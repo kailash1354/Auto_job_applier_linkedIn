@@ -97,11 +97,11 @@ def find_default_profile_directory() -> str | None:
             str(home / ".config" / "google-chrome"),
             str(home / ".var" / "app" / "com.google.Chrome" / "data" / ".config" / "google-chrome"),
         ]
-    # MacOS ## For some reason, opening with profile in MacOS is not creating a session for undetected-chromedriver!
-    # elif sys.platform == 'darwin':
-    #     paths = [
-    #         str(home / "Library" / "Application Support" / "Google" / "Chrome")
-    #     ]
+    # MacOS
+    elif sys.platform == 'darwin':
+        paths = [
+            str(home / "Library" / "Application Support" / "Google" / "Chrome")
+        ]
     else:
         return None
 
@@ -255,6 +255,27 @@ def buffer(speed: int=0) -> None:
         return sleep(randint(18,round(speed)*10)*0.1)
 
 
+def runtime_pause(kind: str = "between_jobs") -> None:
+    """Use one bounded, jittered pause for normal bot pacing."""
+    from random import uniform
+    ranges = {
+        "after_apply": (1.0, 2.0),
+        "between_jobs": (0.8, 1.5),
+        "between_pages": (0.8, 1.5),
+    }
+    low, high = ranges.get(kind, ranges["between_jobs"])
+    # The browser control can tune cadence for this run only. Import lazily to
+    # avoid making helpers a hard dependency of the Flask runtime store.
+    try:
+        from modules.runtime_control import read_state
+        profile = (read_state().get("settings") or {}).get("timing_profile", "balanced")
+        multiplier = {"faster": 0.8, "balanced": 1.0, "careful": 1.3}.get(profile, 1.0)
+        low, high = low * multiplier, high * multiplier
+    except Exception:
+        pass
+    sleep(uniform(low, high))
+
+
 def human_type(target, text: str) -> None:
     '''
     Types `text` one character at a time, with a human-ish gap between key strokes,
@@ -278,19 +299,19 @@ def human_type(target, text: str) -> None:
 
 def manual_login_retry(is_logged_in: callable, limit: int = 2) -> None:
     '''
-    Function to ask and validate manual login
+    Function to ask and validate manual login / 2FA checkpoint
     '''
     count = 0
     while not is_logged_in():
         from pyautogui import alert
-        print_lg("Seems like you're not logged in!")
+        print_lg("LinkedIn security checkpoint or login required! Please approve on your phone or browser.")
         button = "Confirm Login"
-        message = 'After you successfully Log In, please click "{}" button below.'.format(button)
+        message = 'LinkedIn security checkpoint / login required!\n\n1. Approve the notification on your phone or complete sign-in in the browser.\n2. Once done, click "Confirm Login" below.'
         if count > limit:
             button = "Skip Confirmation"
-            message = 'If you\'re seeing this message even after you logged in, Click "{}". Seems like auto login confirmation failed!'.format(button)
+            message = 'If you are already on the feed, click "Skip Confirmation".'
         count += 1
-        if alert(message, "Login Required", button) and count > limit: return
+        if alert(message, "LinkedIn Login / 2FA Required", button) and count > limit: return
 
 
 
@@ -362,5 +383,3 @@ def truncate_for_csv(data, max_length: int = 131000, suffix: str = "...[TRUNCATE
         return text[:max_length - len(suffix)] + suffix
     except Exception as e:
         return f"[could not stringify value: {e}]"
-
-

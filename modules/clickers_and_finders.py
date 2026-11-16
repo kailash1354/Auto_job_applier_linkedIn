@@ -128,14 +128,34 @@ def boolean_button_click(driver: WebDriver, actions: ActionChains, text: str) ->
     Tries to click on the boolean button with the given `text` text.
     '''
     try:
-        list_container = driver.find_element(By.XPATH, text_xpath("h3", text) + '/ancestor::fieldset')
-        # The switch input itself is often visually hidden by design, so don't filter it on displayed.
-        button = list_container.find_element(By.XPATH, './/input[@role="switch"]')
-        scroll_to_view(driver, button)
-        actions.move_to_element(button).click().perform()
+        # Strategy 1: Fieldset switch
+        try:
+            list_container = driver.find_element(By.XPATH, text_xpath("h3", text) + '/ancestor::fieldset')
+            button = list_container.find_element(By.XPATH, './/input[@role="switch"]')
+            scroll_to_view(driver, button)
+            actions.move_to_element(button).click().perform()
+            buffer(click_gap)
+            return
+        except Exception:
+            pass
+
+        # Strategy 2: Direct button or pill
+        try:
+            btn = driver.find_element(By.XPATH, f'//button[normalize-space()="{text}" or contains(@aria-label, "{text}")]')
+            scroll_to_view(driver, btn)
+            btn.click()
+            buffer(click_gap)
+            return
+        except Exception:
+            pass
+
+        # Strategy 3: Span button
+        btn2 = driver.find_element(By.XPATH, f'//span[normalize-space()="{text}"]/ancestor::button')
+        scroll_to_view(driver, btn2)
+        btn2.click()
         buffer(click_gap)
     except Exception as e:
-        logger.warning("Click Failed! Didn't find '%s' (%s)", text, type(e).__name__)
+        logger.warning("Click Failed! Didn't find boolean button '%s' (%s)", text, type(e).__name__)
 
 # Find functions
 def find_by_class(driver: WebDriver, class_name: str, time: float=5.0) -> WebElement | Exception:

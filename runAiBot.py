@@ -30,6 +30,7 @@ from random import choice, shuffle
 from datetime import datetime
 
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support.select import Select
@@ -46,6 +47,8 @@ from modules.open_chrome import *
 from modules.helpers import *
 from modules.clickers_and_finders import *
 from modules.validator import validate_config
+from modules.bot_control import install_control_menu, read_control_state, reset_refresh_flag, publish_status
+from modules import runtime_control
 
 if use_AI:
     from modules.ai.connections import create_ai_client, extract_skills, answer_question, close_ai_client
@@ -66,8 +69,10 @@ if run_in_background == True:
 # so the process hangs forever and reads as "the bot does nothing". Work that out once
 # and degrade every dialog in this file to a log line.
 interactive_session = not run_in_background and bool(getattr(sys.stdout, "isatty", lambda: False)())
+# An unanswered form must be recoverable. Manual intervention can still happen through
+# the browser bubble, but the automation path never opens a blocking desktop dialog.
+pause_at_failed_question = False
 if not interactive_session:
-    pause_at_failed_question = False
     pause_before_submit = False
     pause_after_filters = False
     def _suppressed_dialog(text: str = "", title: str = "", *args, **kwargs) -> None:
@@ -108,6 +113,16 @@ failed_count = 0
 skip_count = 0
 dailyEasyApplyLimitReached = False
 
+
+def publish_progress(unresolved: int = 0) -> None:
+    """Keep the floating UI truthful even when a job is skipped mid-flow."""
+    publish_status(progress={
+        "processed": easy_applied_count + external_jobs_count + skip_count + failed_count,
+        "applied": easy_applied_count + external_jobs_count,
+        "skipped": skip_count + failed_count,
+        "unresolved": unresolved,
+    })
+
 re_experience = re.compile(r'[(]?\s*(\d+)\s*[)]?\s*[-to]*\s*\d*[+]*\s*year[s]?', re.IGNORECASE)
 
 desired_salary_lakhs = str(round(desired_salary / 100000, 2))
@@ -124,10 +139,13 @@ notice_period = str(notice_period)
 
 aiClient = None
 about_company_for_ai = None  # filled in later, once we're processing a specific job
+active_search_term = ""
 
 # Dry run: fill everything in, reach the Review step, then discard instead of submitting.
 # Belongs in config/settings.py; read defensively so an older config keeps working.
 stop_before_submit = globals().get("stop_before_submit", False)
+if os.environ.get("BOT_DRY_RUN", "").strip().lower() in ("1", "true", "yes"):
+    stop_before_submit = True
 
 # "Are you legally authorized to work here?" is a different question from "do you need
 # sponsorship?". Belongs in config/questions.py; read defensively so an older config keeps
@@ -246,19 +264,101 @@ def set_search_location() -> None:
     if search_location.strip():
         try:
             print_lg(f'Setting search location as: "{search_location.strip()}"')
-            search_location_ele = try_xp(driver, ".//input[@aria-label='City, state, or zip code'and not(@disabled)]", False) #  and not(@aria-hidden='true')]")
-            text_input(actions, search_location_ele, search_location, "Search Location")
-        except ElementNotInteractableException:
-            try_xp(driver, ".//label[@class='jobs-search-box__input-icon jobs-search-box__keywords-label']")
-            actions.send_keys(Keys.TAB, Keys.TAB).perform()
-            actions.key_down(Keys.CONTROL).send_keys("a").key_up(Keys.CONTROL).perform()
-            human_type(actions, search_location.strip())
-            sleep(2)
-            actions.send_keys(Keys.ENTER).perform()
-            try_xp(driver, ".//button[@aria-label='Cancel']")
+            search_location_ele = try_xp(driver, ".//input[@aria-label='City, state, or zip code'and not(@disabled)]", False)
+            if search_location_ele:
+                text_input(actions, search_location_ele, search_location, "Search Location")
+            else:
+                print_lg("Search location input element not found, skipping location input.")
         except Exception as e:
-            try_xp(driver, ".//button[@aria-label='Cancel']")
             logger.warning("Failed to update search location, continuing with default location! %s", e)
+
+
+def open_job_search(search_term: str) -> None:
+    '''Open a LinkedIn job search using the current Jobs page UI.
+
+    LinkedIn now redirects direct ``/jobs/search/?keywords=...`` requests to a
+    shell page that has no result cards.  Entering the term in the visible Jobs
+    search field works across the current layout and keeps the old URL as a
+    compatibility fallback.
+    '''
+    global active_search_term
+    active_search_term = search_term.strip()
+    runtime_control.update_state(settings={
+        "search_term": active_search_term,
+        "location": search_location,
+        "easy_apply_only": easy_apply_only,
+        "use_ai": use_AI,
+    })
+    driver.get("https://www.linkedin.com/jobs/")
+    install_control_menu(driver)
+    search_input = None
+    search_input_xpaths = (
+        "//input[contains(@placeholder, 'Describe the job')]",
+        "//input[@aria-label='Search by title, skill, or company']",
+        "//input[contains(@placeholder, 'Search by title')]",
+    )
+    for xpath in search_input_xpaths:
+        try:
+            search_input = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.XPATH, xpath))
+            )
+            break
+        except Exception:
+            search_input = None
+
+    if search_input:
+        search_input.clear()
+        search_input.send_keys(search_term)
+        search_input.send_keys(Keys.ENTER)
+        WebDriverWait(driver, 20).until(EC.url_contains("/jobs/search-results"))
+        install_control_menu(driver)
+        return
+
+    logger.warning("Current Jobs search field was not found; trying the legacy search URL.")
+    driver.get(f"https://www.linkedin.com/jobs/search/?keywords={search_term}")
+    install_control_menu(driver)
+
+
+JOB_LISTING_XPATH = (
+    "//li[@data-occludable-job-id or @data-job-id or contains(@class, 'job-card-container') or contains(@class, 'jobs-search-results__list-item')]"
+    " | //*[@role='button' and starts-with(@componentkey, 'job-card-component-ref-')]"
+)
+
+
+def wait_for_bot_control() -> None:
+    while True:
+        state = read_control_state(driver)
+        settings = state.get("settings") or {}
+        _apply_runtime_settings(settings)
+        if state.get("stop"):
+            publish_status(status="stopping")
+            raise KeyboardInterrupt("Stopped from the Job Applier Bot menu")
+        if state.get("refresh"):
+            term = active_search_term or str(settings.get("search_term") or "").strip()
+            if term:
+                open_job_search(term)
+                apply_filters()
+            else:
+                driver.refresh()
+                WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                install_control_menu(driver)
+            reset_refresh_flag(driver)
+        if not state.get("paused"):
+            return
+        time.sleep(0.25)
+
+
+def _apply_runtime_settings(settings: dict) -> None:
+    """Apply only safe transient settings; persistent config remains unchanged."""
+    global search_location, easy_apply_only, use_AI, active_search_term
+    if str(settings.get("search_term") or "").strip():
+        active_search_term = str(settings["search_term"]).strip()
+    if settings.get("location"):
+        search_location = str(settings["location"]).strip()
+    if isinstance(settings.get("easy_apply_only"), bool):
+        easy_apply_only = settings["easy_apply_only"]
+    if isinstance(settings.get("use_ai"), bool):
+        use_AI = settings["use_ai"]
 
 
 def recommended_filter_wait(gap: int) -> int:
@@ -275,55 +375,67 @@ def apply_filters() -> None:
     try:
         recommended_wait = recommended_filter_wait(click_gap)
 
-        # element_to_be_clickable, not presence: the filters button renders before it's usable.
-        wait.until(EC.element_to_be_clickable((By.XPATH, '//button[normalize-space()="All filters"]'))).click()
-        buffer(recommended_wait)
+        # Try clicking "All filters" if present; otherwise try top-level Easy Apply pill
+        try:
+            all_filters_btn = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.XPATH, '//button[normalize-space()="All filters"]'))
+            )
+        except Exception:
+            all_filters_btn = False
+        if all_filters_btn:
+            all_filters_btn.click()
+            buffer(recommended_wait)
 
-        wait_span_click(driver, sort_by)
-        wait_span_click(driver, date_posted)
-        buffer(recommended_wait)
+            wait_span_click(driver, sort_by)
+            wait_span_click(driver, date_posted)
+            buffer(recommended_wait)
 
-        multi_sel_noWait(driver, experience_level) 
-        multi_sel_noWait(driver, companies, actions)
-        if experience_level or companies: buffer(recommended_wait)
+            multi_sel_noWait(driver, experience_level)
+            multi_sel_noWait(driver, companies, actions)
+            if experience_level or companies: buffer(recommended_wait)
 
-        multi_sel_noWait(driver, job_type)
-        multi_sel_noWait(driver, on_site)
-        if job_type or on_site: buffer(recommended_wait)
+            multi_sel_noWait(driver, job_type)
+            multi_sel_noWait(driver, on_site)
+            if job_type or on_site: buffer(recommended_wait)
 
-        if easy_apply_only: boolean_button_click(driver, actions, "Easy Apply")
-        
-        multi_sel_noWait(driver, location)
-        multi_sel_noWait(driver, industry)
-        if location or industry: buffer(recommended_wait)
+            if easy_apply_only: boolean_button_click(driver, actions, "Easy Apply")
 
-        multi_sel_noWait(driver, job_function)
-        multi_sel_noWait(driver, job_titles)
-        if job_function or job_titles: buffer(recommended_wait)
+            multi_sel_noWait(driver, location)
+            multi_sel_noWait(driver, industry)
+            if location or industry: buffer(recommended_wait)
 
-        if under_10_applicants: boolean_button_click(driver, actions, "Under 10 applicants")
-        if in_your_network: boolean_button_click(driver, actions, "In your network")
-        if fair_chance_employer: boolean_button_click(driver, actions, "Fair Chance Employer")
+            multi_sel_noWait(driver, job_function)
+            multi_sel_noWait(driver, job_titles)
+            if job_function or job_titles: buffer(recommended_wait)
 
-        wait_span_click(driver, salary)
-        buffer(recommended_wait)
-        
-        multi_sel_noWait(driver, benefits)
-        multi_sel_noWait(driver, commitments)
-        if benefits or commitments: buffer(recommended_wait)
+            if under_10_applicants: boolean_button_click(driver, actions, "Under 10 applicants")
+            if in_your_network: boolean_button_click(driver, actions, "In your network")
+            if fair_chance_employer: boolean_button_click(driver, actions, "Fair Chance Employer")
 
-        show_results_button: WebElement = wait.until(EC.element_to_be_clickable((By.XPATH, '//button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "apply current filters to show")]')))
-        show_results_button.click()
-        buffer(3)   # let the results reload settle before anything reads the list
+            wait_span_click(driver, salary)
+            buffer(recommended_wait)
+
+            multi_sel_noWait(driver, benefits)
+            multi_sel_noWait(driver, commitments)
+            if benefits or commitments: buffer(recommended_wait)
+
+            show_results_btn = try_xp(driver, '//button[contains(translate(@aria-label, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "apply current filters to show")]', False)
+            if show_results_btn:
+                show_results_btn.click()
+                buffer(3)   # let the results reload settle before anything reads the list
+        else:
+            print_lg("All filters button not found on page, attempting direct Easy Apply filter...")
+            if easy_apply_only:
+                try_xp(driver, '//button[normalize-space()="Easy Apply"]', True)
+            buffer(2)
 
         global pause_after_filters
-        if pause_after_filters and "Turn off Pause after search" == pyautogui.confirm("These are your configured search results and filter. It is safe to change them while this dialog is open, any changes later could result in errors and skipping this search run.", "Please check your results", ["Turn off Pause after search", "Look's good, Continue"]):
-            pause_after_filters = False
+        if pause_after_filters and interactive_session:
+            if "Turn off Pause after search" == pyautogui.confirm("These are your configured search results and filter. It is safe to change them while this dialog is open, any changes later could result in errors and skipping this search run.", "Please check your results", ["Turn off Pause after search", "Look's good, Continue"]):
+                pause_after_filters = False
 
     except Exception as e:
-        logger.warning("Setting the preferences failed!")
-        pyautogui.confirm(f"Faced error while applying filters. Please make sure correct filters are selected, click on show results and click on any button of this dialog, I know it sucks. Can't turn off Pause after search when error occurs! ERROR: {e}", ["Doesn't look good, but Continue XD", "Look's good, Continue"])
-        # print_lg(e)
+        logger.warning("Setting preferences encountered a non-fatal issue, continuing search: %s", e)
 
 
 
@@ -357,21 +469,34 @@ def get_job_main_details(job: WebElement, blacklisted_companies: set, rejected_j
     * skip: A boolean flag to skip this job
     '''
     skip = False
-    # Every class on a job card that carried data is now a rotating random string, so anchor
-    # on the artdeco lockup structure instead. The title link is no longer the card's first
-    # <a> in every layout either, so address it through the lockup title too.
-    job_details_button = job.find_element(By.XPATH, ".//div[contains(@class,'artdeco-entity-lockup__title')]//a")
+    current_layout = (job.get_attribute("componentkey") or "").startswith("job-card-component-ref-")
+    if current_layout:
+        job_details_button = job
+        card_lines = [line.strip() for line in job.text.splitlines() if line.strip()]
+        title = card_lines[0] if card_lines else "Unknown"
+        offset = 1 if len(card_lines) < 2 or card_lines[1] != title else 2
+        company = card_lines[offset] if len(card_lines) > offset else "Unknown"
+        work_location = card_lines[offset + 1] if len(card_lines) > offset + 1 else "Unknown"
+    else:
+        job_details_button = job.find_element(By.XPATH, ".//div[contains(@class,'artdeco-entity-lockup__title')]//a")
+        title = job_details_button.get_dom_attribute('aria-label') or job_details_button.text
+        title = title.split("\n")[0].removesuffix(" with verification").strip()
+        company = job.find_element(By.XPATH, ".//div[contains(@class,'artdeco-entity-lockup__subtitle')]").text.strip()
+        location_ele = try_xp(job, ".//ul[contains(@class,'job-card-container__metadata-wrapper')]//span[@dir='ltr']", False)
+        work_location = location_ele.text.strip() if location_ele else "Unknown"
     scroll_to_view(driver, job_details_button, True)
-    job_id = job.get_dom_attribute('data-occludable-job-id')
-    # aria-label is the whole title; .text of the link also drags in the verified-badge node,
-    # and slicing at the first "\n" silently ate the last character when there wasn't one.
-    title = job_details_button.get_dom_attribute('aria-label') or job_details_button.text
-    title = title.split("\n")[0].removesuffix(" with verification").strip()
-    # The subtitle used to read "Company · Location (Style)". It is now the company alone,
-    # and the location moved into its own metadata list.
-    company = job.find_element(By.XPATH, ".//div[contains(@class,'artdeco-entity-lockup__subtitle')]").text.strip()
-    location_ele = try_xp(job, ".//ul[contains(@class,'job-card-container__metadata-wrapper')]//span[@dir='ltr']", False)
-    work_location = location_ele.text.strip() if location_ele else "Unknown"
+    job_id = job.get_dom_attribute('data-occludable-job-id') or job.get_dom_attribute('data-job-id')
+    if not job_id and current_layout:
+        job_id = (job.get_attribute("componentkey") or "").rsplit("-", 1)[-1]
+    if not job_id:
+        try:
+            href = job_details_button.get_dom_attribute('href') or ""
+            if "/view/" in href:
+                match = re.search(r'/view/(\d+)', href)
+                if match: job_id = match.group(1)
+        except: pass
+    if not job_id:
+        job_id = "job_" + str(randint(10000, 99999))
     work_style = "Unknown"
     if '(' in work_location and ')' in work_location:
         work_style = work_location[work_location.rfind('(')+1:work_location.rfind(')')]
@@ -434,10 +559,11 @@ visa_terms = ['sponsor', 'sponsors', 'sponsorship', 'visa', 'visas', 'work permi
 # citizenship answered it with the descriptive citizenship status, which is not a valid
 # option in a Yes/No dropdown, so the fallback mapped it to "No" and told employers the
 # applicant was not authorized to work.
-authorization_terms = ['employment eligibility', 'legally authorized', 'legally authorised',
+authorization_terms = ['employment eligibility', 'eligibility to work', 'eligible to work',
+                       'legally authorized', 'legally authorised',
                        'authorized to work', 'authorised to work', 'work authorization',
                        'work authorisation', 'right to work']
-citizenship_terms = ['citizen', 'citizens', 'citizenship']
+citizenship_terms = ['citizen', 'citizens', 'citizenship', 'nationality']
 
 # Answer -> dropdown option mapping (see the NoSuchElementException fallback in
 # `answer_questions`). Matched with `find_bad_word`, i.e. whole words: 'no' as a substring
@@ -511,6 +637,13 @@ def match_answer_to_option(answer: str | None, option_texts: list[str]) -> int |
     else:
         candidate_phrases = [answer, answer.lower(), answer.upper(),
                              ''.join(ch for ch in answer if ch.isalnum())]
+        demonyms = {
+            'india': ['Indian'],
+            'united states': ['American', 'U.S. Citizen', 'US Citizen'],
+            'united kingdom': ['British', 'English', 'Scottish', 'Welsh'],
+            'uae': ['Emirati'],
+        }
+        candidate_phrases.extend(demonyms.get(str(answer).strip().lower(), []))
     for phrase in candidate_phrases:
         for i, option in enumerate(option_texts):
             if not (find_bad_word(option, [phrase]) or find_bad_word(phrase, [option])):
@@ -525,8 +658,14 @@ def match_answer_to_option(answer: str | None, option_texts: list[str]) -> int |
 
 # Function to check for Blacklisted words in About Company
 def check_blacklist(rejected_jobs: set, job_id: str, company: str, blacklisted_companies: set) -> tuple[set, set, WebElement] | ValueError:
-    jobs_top_card = try_find_by_classes(driver, ["job-details-jobs-unified-top-card__primary-description-container","job-details-jobs-unified-top-card__primary-description","jobs-unified-top-card__primary-description","jobs-details__main-content"])
-    about_company_org = find_by_class(driver, "jobs-company__box")
+    try:
+        jobs_top_card = try_find_by_classes(driver, ["job-details-jobs-unified-top-card__primary-description-container","job-details-jobs-unified-top-card__primary-description","jobs-unified-top-card__primary-description","jobs-details__main-content"])
+    except ValueError:
+        jobs_top_card = driver.find_element(By.TAG_NAME, "body")
+    try:
+        about_company_org = find_by_class(driver, "jobs-company__box")
+    except Exception:
+        about_company_org = driver.find_element(By.TAG_NAME, "body")
     scroll_to_view(driver, about_company_org)
     about_company_org = about_company_org.text
     about_company = about_company_org.lower()
@@ -586,7 +725,13 @@ def get_job_description(
     skipMessage = None
     try:
         found_masters = 0
-        jobDescription = find_by_class(driver, "jobs-box__html-content").text
+        try:
+            jobDescription = find_by_class(driver, "jobs-box__html-content").text
+        except Exception:
+            page_text = driver.find_element(By.TAG_NAME, "body").text
+            start = page_text.find("About the job")
+            end = page_text.find("About the company", start + 1)
+            jobDescription = page_text[start:end if end > start else None].strip() if start >= 0 else page_text
         jobDescriptionLow = jobDescription.lower()
         bad_word = find_bad_word(jobDescription, bad_words)
         if bad_word:
@@ -662,6 +807,28 @@ def answer_common_questions(label: str, answer: str | None) -> str | None:
     return auth_answer if auth_answer is not None else answer
 
 
+def _question_required(question: WebElement) -> bool:
+    """Detect LinkedIn's required marker without relying on one renderer's classes."""
+    try:
+        inspected = False
+        if (question.get_attribute("aria-required") or "").lower() == "true":
+            return True
+        inspected = True
+        if question.get_attribute("required") is not None:
+            return True
+        for control in question.find_elements(By.XPATH, ".//*[@required or @aria-required='true']"):
+            if control.is_displayed():
+                return True
+        label_text = question.text or ""
+        return bool(re.search(r"(?:^|\s)\*\s*$", label_text.strip()))
+    except AttributeError:
+        # Compatibility with lightweight test doubles and older wrappers that do not
+        # expose attributes. Their questions predate the required/optional distinction.
+        return True
+    except Exception:
+        return False
+
+
 # Function to answer the questions for Easy Apply
 def answer_questions(modal: WebElement, questions_list: set, work_location: str, job_description: str | None = None ) -> set:
     # Get all questions from the page
@@ -669,6 +836,25 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
     # The container class churns (it is `fb-dash-form-element` today, paired with a random
     # class). `data-test-form-element` is the attribute that has survived every restyle.
     all_questions = modal.find_elements(By.XPATH, ".//div[@data-test-form-element]")
+    if not all_questions:
+        # LinkedIn has used three equivalent container contracts across the current and
+        # legacy Easy Apply renderers. Keep the fallback scoped to the dialog and dedupe
+        # elements because some forms expose both a wrapper and a component marker.
+        fallback_questions = modal.find_elements(
+            By.XPATH,
+            ".//div[contains(@class,'fb-dash-form-element') or "
+            "@data-test-text-entity-list-form-component or "
+            "@data-test-single-line-text-form-component or "
+            "@data-test-form-builder-radio-button-form-component or "
+            "starts-with(@componentkey, 'easyApplyFieldFocus_')]"
+        )
+        seen = set()
+        all_questions = []
+        for question in fallback_questions:
+            key = question.id
+            if key not in seen:
+                seen.add(key)
+                all_questions.append(question)
     # Per-pass, not cumulative: the caller compares consecutive passes to spot a stall.
     unanswered_questions.clear()
     # all_list_questions = modal.find_elements(By.XPATH, ".//div[@data-test-text-entity-list-form-component]")
@@ -676,6 +862,7 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
     # all_questions = all_questions + all_list_questions + all_single_line_questions
 
     for Question in all_questions:
+        required = _question_required(Question)
         # Only the typeahead text inputs need the follow-up ARROW_DOWN + ENTER. It used to be
         # set inside the text branch alone and read from the textarea branch, so any form with
         # a textarea and no earlier text input died with UnboundLocalError.
@@ -686,7 +873,11 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             label_org = "Unknown"
             try:
                 label = Question.find_element(By.TAG_NAME, "label")
-                label_org = label.find_element(By.TAG_NAME, "span").text
+                try:
+                    label_org = label.find_element(By.TAG_NAME, "span").text
+                except Exception:
+                    # Current SDUI labels use a visible div instead of the legacy span.
+                    label_org = label.text
             except: pass
             # No default answer. `answer = 'Yes'` here meant an unclassified dropdown -
             # "Do you have an active security clearance?" - was answered Yes and submitted,
@@ -701,39 +892,59 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 optionsText = [option.text for option in select.options]
                 options = "".join([f' "{option}",' for option in optionsText])
             prev_answer = selected_option
-            if overwrite_previous_answers or selected_option == "Select an option":
+            if overwrite_previous_answers or selected_option in ("", "Select an option"):
                 # Pick a sensible answer for the dropdown from the question label.
                 # Whole words only, and work authorization first: "Are you currently legally
                 # authorized to work in the United States?" contains "state" and used to be
                 # answered with the state of residence.
-                auth_answer = work_authorization_answer(label)
-                if auth_answer is not None:
-                    answer = auth_answer
-                elif label_has(label, 'email', 'phone'):
-                    answer = prev_answer
-                elif label_has(label, 'gender', 'sex', 'sexual orientation'):
-                    answer = gender
-                elif label_has(label, 'disability'):
-                    answer = disability_status
-                elif label_has(label, 'proficiency'):
-                    answer = 'Professional'
-                elif label_has(label, 'location', 'city', 'state', 'country'):
-                    if label_has(label, 'country'):
-                        answer = country
-                    elif label_has(label, 'state'):
-                        answer = state
-                    elif label_has(label, 'city'):
-                        answer = current_city if current_city else work_location
-                    else:
-                        answer = work_location
+                if label_has(label, 'nationality'):
+                    # LinkedIn's current form asks for a demonym (for example, Indian),
+                    # while the personal configuration stores the country (India).
+                    answer = country
                 else:
-                    answer = answer_common_questions(label, answer)
+                    auth_answer = work_authorization_answer(label)
+                    if auth_answer is not None:
+                        answer = auth_answer
+                    elif label_has(label, 'email', 'phone'):
+                        answer = prev_answer
+                    elif label_has(label, 'gender', 'sex', 'sexual orientation'):
+                        answer = gender
+                    elif label_has(label, 'disability'):
+                        answer = disability_status
+                    elif label_has(label, 'proficiency'):
+                        answer = 'Professional'
+                    elif label_has(label, 'location', 'city', 'state', 'country'):
+                        if label_has(label, 'country'):
+                            answer = country
+                        elif label_has(label, 'state'):
+                            answer = state
+                        elif label_has(label, 'city'):
+                            answer = current_city if current_city else work_location
+                        else:
+                            answer = work_location
+                    else:
+                        answer = answer_common_questions(label, answer)
                 try:
                     if answer is None: raise NoSuchElementException(label_org)
                     select.select_by_visible_text(answer)
                 except NoSuchElementException:
                     # The exact text isn't an option; map our answer onto the nearest option.
                     matched = match_answer_to_option(answer, optionsText)
+                    if matched is None and required and use_AI and aiClient and optionsText:
+                        try:
+                            ai_answer = answer_question(
+                                aiClient,
+                                f'{label_org}\nChoose exactly one option from: {optionsText}',
+                                question_type="select",
+                                job_description=job_description,
+                                user_information_all=user_information_all,
+                            )
+                            matched = match_answer_to_option(ai_answer, optionsText)
+                            if matched is not None:
+                                answer = optionsText[matched]
+                                print_lg(f'AI selected an existing option for "{label_org}".')
+                        except Exception as e:
+                            logger.warning("Failed to get AI select answer for %s: %s", label_org, e)
                     if matched is not None:
                         select.select_by_visible_text(optionsText[matched])
                         answer = optionsText[matched]
@@ -743,8 +954,9 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                         # (pause_at_failed_question, else a failed application) takes over.
                         print_lg(f'No option matched "{answer or "a configured answer"}" for "{label_org}". Leaving it unanswered instead of guessing.')
                         answer = prev_answer
-                        randomly_answered_questions.add((f'{label_org} [ {options} ]', "select"))
-                        unanswered_questions.add(f'{label_org} [ {options} ]')
+                        if required:
+                            randomly_answered_questions.add((f'{label_org} [ {options} ]', "select"))
+                            unanswered_questions.add(f'{label_org} [ {options} ]')
             else: answer = prev_answer
             questions_list.add((f'{label_org} [ {options} ]', answer, "select", prev_answer))
             continue
@@ -795,8 +1007,9 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                         # Leave the group untouched so the stall guard skips the job.
                         print_lg(f'No option matched "{answer}" for "{label_org} ]". Leaving it unanswered instead of guessing.')
                         answer = prev_answer
-                        randomly_answered_questions.add((f'{label_org} ]',"radio"))
-                        unanswered_questions.add(f'{label_org} ]')
+                        if required:
+                            randomly_answered_questions.add((f'{label_org} ]',"radio"))
+                            unanswered_questions.add(f'{label_org} ]')
                     else:
                         actions.move_to_element(options[matched]).click().perform()
                         answer = options_labels[matched]
@@ -810,7 +1023,10 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             label = try_xp(Question, ".//label[@for]", False)
             try: label = label.find_element(By.CLASS_NAME,'visually-hidden')
             except: pass
-            label_org = label.text if label else "Unknown"
+            label_org = label.text if label else (
+                text.get_attribute('aria-label') or text.get_attribute('placeholder') or
+                Question.get_attribute('componentkey') or "Unknown"
+            )
             answer = "" # years_of_experience
             label = label_org.lower()
 
@@ -875,7 +1091,7 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 else: answer = answer_common_questions(label,answer)
                 if answer == "":
                     ai_answer = ""
-                    if use_AI and aiClient:
+                    if required and use_AI and aiClient and not label_has(label, 'middle'):
                         try:
                             ai_answer = answer_question(aiClient, label_org, question_type="text", job_description=job_description, user_information_all=user_information_all)
                         except Exception as e:
@@ -888,10 +1104,13 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                         # "How many years of Kubernetes?", "What is your expected salary?"
                         # and "How many people did you manage?" were all submitted as the
                         # user's total years of experience - wrong data on a real
-                        # application. Report it and let the stall guard skip the job.
-                        print_lg(f'No answer for the text question "{label_org}". Leaving it empty - add it to config/questions.py.')
-                        randomly_answered_questions.add((label_org, "text"))
-                        unanswered_questions.add(label_org)
+                        # application. Report required unknowns and let the stall guard skip
+                        # the job. LinkedIn's current form renders Middle Name as optional
+                        # even though its surrounding SDUI component has no required marker.
+                        if required and not label_has(label, 'middle'):
+                            print_lg(f'No answer for the text question "{label_org}". Leaving it empty - add it to config/questions.py.')
+                            randomly_answered_questions.add((label_org, "text"))
+                            unanswered_questions.add(label_org)
                 text.clear()
                 human_type(text, answer)
                 if do_actions:
@@ -905,7 +1124,10 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
         text_area = try_xp(Question, ".//textarea", False)
         if text_area:
             label = try_xp(Question, ".//label[@for]", False)
-            label_org = label.text if label else "Unknown"
+            label_org = label.text if label else (
+                text_area.get_attribute('aria-label') or text_area.get_attribute('placeholder') or
+                Question.get_attribute('componentkey') or "Unknown"
+            )
             label = label_org.lower()
             answer = ""
             prev_answer = text_area.get_attribute("value")
@@ -914,7 +1136,7 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 elif label_has(label, 'cover'): answer = cover_letter
                 if answer == "":
                     ai_answer = ""
-                    if use_AI and aiClient:
+                    if required and use_AI and aiClient:
                         try:
                             ai_answer = answer_question(aiClient, label_org, question_type="textarea", job_description=job_description, user_information_all=user_information_all)
                         except Exception as e:
@@ -923,8 +1145,9 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                         answer = ai_answer.strip()
                         print_lg(f'AI answered "{label_org}": "{answer}"')
                     else:
-                        randomly_answered_questions.add((label_org, "textarea"))
-                        unanswered_questions.add(label_org)
+                        if required:
+                            randomly_answered_questions.add((label_org, "textarea"))
+                            unanswered_questions.add(label_org)
             text_area.clear()
             human_type(text_area, answer)
             questions_list.add((label, text_area.get_attribute("value"), "textarea", prev_answer))
@@ -938,10 +1161,15 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
             # too would fight that setting, so leave it to its one owner.
             if checkbox.get_attribute("id") == "follow-company-checkbox": continue
             label = try_xp(Question, ".//span[@class='visually-hidden']", False)
-            label_org = label.text if label else "Unknown"
+            if not label:
+                label = try_xp(Question, ".//label[@for]", False)
+            label_org = label.text if label else (
+                checkbox.get_attribute('aria-label') or
+                Question.get_attribute('componentkey') or "Unknown"
+            )
             label = label_org.lower()
             answer = try_xp(Question, ".//label[@for]", False)  # Sometimes multiple checkboxes are given for 1 question, Not accounted for that yet
-            answer = answer.text if answer else "Unknown"
+            answer = answer.text if answer else (checkbox.get_attribute('aria-label') or "Unknown")
             prev_answer = checkbox.is_selected()
             checked = prev_answer
             if not prev_answer:
@@ -954,8 +1182,9 @@ def answer_questions(modal: WebElement, questions_list: set, work_location: str,
                 blocked = f'{label_org} ([ ] {answer})'
                 print_lg('Not ticking "{}": it {}. Tick it yourself, it is not something to guess.'.format(
                     blocked, f'is an attestation or consent ("{term}")' if term else 'cannot be classified'))
-                randomly_answered_questions.add((blocked, "checkbox"))
-                unanswered_questions.add(blocked)
+                if required:
+                    randomly_answered_questions.add((blocked, "checkbox"))
+                    unanswered_questions.add(blocked)
             questions_list.add((f'{label} ([X] {answer})', checked, "checkbox", prev_answer))
             continue
 
@@ -987,11 +1216,11 @@ def external_apply(pagination_element: WebElement, job_id: str, job_link: str, r
             if "exceeded the daily application limit" in driver.find_element(By.CLASS_NAME, "artdeco-inline-feedback__message").text: dailyEasyApplyLimitReached = True
         except: pass
         print_lg("Not an Easy Apply job (easy_apply_only is on), skipping it.")
-        if pagination_element != None:
-            # Count it. This used to return before touching any counter, so a run where
-            # Easy Apply detection was broken summarised as 0/0/0/0 - "it found no jobs".
-            skip_count += 1
-            return True, application_link, tabs_count
+        # New LinkedIn result layouts do not always expose pagination. The filter is
+        # still authoritative: never fall through into the external-Apply branch.
+        skip_count += 1
+        publish_progress()
+        return True, application_link, tabs_count
     try:
         # The design-system button SIZE class this used to also require (artdeco-button--<n>)
         # has nothing to do with applying and churns with every restyle, so it's gone.
@@ -1011,6 +1240,8 @@ def external_apply(pagination_element: WebElement, job_id: str, job_link: str, r
         failed_job(job_id, job_link, resume, date_listed, "Probably didn't find Apply button or unable to switch tabs.", e, application_link, screenshot_name)
         global failed_count
         failed_count += 1
+        publish_status(last_error=f"External application failed: {type(e).__name__}")
+        publish_progress()
         return True, application_link, tabs_count
 
 
@@ -1018,9 +1249,34 @@ def external_apply(pagination_element: WebElement, job_id: str, job_link: str, r
 # Easy Apply modal buttons. All of these are `type="button"`, so type is no help, and all of
 # them must be searched INSIDE the dialog: document-wide, "Next" also matches the search
 # results pagination control (aria-label "View next page").
-next_button_xpath = './/button[@aria-label="Continue to next step" or contains(normalize-space(.), "Next")]'
-review_button_xpath = './/button[@aria-label="Review your application" or normalize-space(.)="Review"]'
+next_button_xpath = './/button[contains(@aria-label, "Continue") or contains(normalize-space(.), "Continue") or contains(normalize-space(.), "Next")]'
+review_button_xpath = './/button[contains(@aria-label, "Review") or normalize-space(.)="Review" or contains(normalize-space(.), "Review")]'
 submit_button_xpath = './/button[@aria-label="Submit application" or normalize-space(.)="Submit application"]'
+
+def click_easy_apply_navigation(modal: WebElement, xpath: str, timeout: float = 10) -> WebElement | bool:
+    '''Click current or legacy Easy Apply navigation, including LinkedIn's SDUI inner span.'''
+    try:
+        button = WebDriverWait(driver, timeout).until(
+            lambda _: next((element for element in modal.find_elements(By.XPATH, xpath)
+                            if element.is_displayed() and element.is_enabled()), False)
+        )
+        scroll_to_view(driver, button, True)
+        try:
+            button.click()
+        except ElementClickInterceptedException:
+            button.find_element(By.XPATH, ".//span[normalize-space()]").click()
+        buffer(click_gap)
+        return button
+    except Exception as first_error:
+        try:
+            button = modal.find_element(By.XPATH, xpath)
+            inner = button.find_element(By.XPATH, ".//span[normalize-space()]")
+            inner.click()
+            buffer(click_gap)
+            return button
+        except Exception:
+            logger.warning('Easy Apply navigation click failed for "%s": %s', xpath, first_error)
+            return False
 
 # Easy Apply detection strategies, tried in order, most stable signal first. The button also
 # still says "Easy Apply" in its aria-label - the widely repeated claim that LinkedIn dropped
@@ -1032,7 +1288,9 @@ easy_apply_locators = [
     # ponytail: not seen in the captured DOM, kept as a cheap extra shot before the classes.
     ("in-app apply URL flag", ".//a[contains(@href, 'openSDUIApplyFlow=true')]"),
     ("aria-label", ".//button[contains(@class,'jobs-apply-button') and contains(@aria-label, 'Easy Apply')]"),
+    ("current Easy Apply aria-label", ".//button[contains(@aria-label, 'Easy Apply to this job')]"),
     ("button label", ".//button[contains(@class,'jobs-apply-button')][.//span[contains(normalize-space(.), 'Easy Apply')]]"),
+    ("current Easy Apply text", ".//button[normalize-space(.)='Easy Apply']"),
     ("apply button", apply_button_xpath),
 ]
 
@@ -1118,11 +1376,14 @@ def submitted_jobs(job_id: str, title: str, company: str, work_location: str, wo
 
 # The "Save this application?" confirmation that the modal's Dismiss button raises.
 # `data-control-name` is the language-independent anchor; the text is the fallback.
-discard_button_xpath = ".//button[@data-control-name='discard_application_confirm_btn' or contains(normalize-space(.), 'Discard')]"
+discard_button_xpath = "//button[@data-control-name='discard_application_confirm_btn' or contains(normalize-space(.), 'Discard')]"
 
 def easy_apply_modal_is_open() -> bool:
     '''True while an Easy Apply modal is still on screen and swallowing every click.'''
-    try: return any(m.is_displayed() for m in driver.find_elements(By.CLASS_NAME, "jobs-easy-apply-modal"))
+    try:
+        if any(m.is_displayed() for m in driver.find_elements(By.CLASS_NAME, "jobs-easy-apply-modal")):
+            return True
+        return any(m.is_displayed() for m in driver.find_elements(By.XPATH, "//dialog[@open] | //*[@role='dialog']"))
     except Exception: return False
 
 # Function to discard the job application
@@ -1136,7 +1397,7 @@ def discard_job() -> None:
     dialog animation (2s was too short), click Discard, and verify the modal is gone.
     ESCAPE stays as the fallback.
     '''
-    for dismiss in (lambda: try_xp(driver, ".//button[@data-test-modal-close-btn]"),
+    for dismiss in (lambda: try_xp(driver, "//button[@data-test-modal-close-btn]"),
                     lambda: actions.send_keys(Keys.ESCAPE).perform()):
         try: dismiss()
         except Exception as e: logger.warning("Couldn't dismiss the application modal. %s", e)
@@ -1169,7 +1430,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
 
     if randomize_search_order:  shuffle(search_terms)
     for searchTerm in search_terms:
-        driver.get(f"https://www.linkedin.com/jobs/search/?keywords={searchTerm}")
+        open_job_search(searchTerm)
         print_lg("\n________________________________________________________________________________________________________________________\n")
         print_lg(f'\n>>>> Now searching for "{searchTerm}" <<<<\n\n')
 
@@ -1179,18 +1440,19 @@ def apply_to_jobs(search_terms: list[str]) -> None:
         try:
             while current_count < switch_number:
                 # Wait until job listings are loaded
-                wait.until(EC.presence_of_all_elements_located((By.XPATH, "//li[@data-occludable-job-id]")))
+                wait.until(EC.presence_of_all_elements_located((By.XPATH, JOB_LISTING_XPATH)))
 
                 pagination_element, current_page = get_page_info()
 
                 # Find all job listings in current page
-                buffer(3)
+                runtime_pause("between_pages")
                 job_index = 0
                 while True:
+                    wait_for_bot_control()
                     # LinkedIn virtualises this list: off-screen <li>s aren't in the DOM yet and
                     # rendered ones go stale as we scroll, so a single snapshot only ever gets
                     # one screenful. Re-query each time instead of holding that snapshot.
-                    job_listings = driver.find_elements(By.XPATH, "//li[@data-occludable-job-id]")
+                    job_listings = driver.find_elements(By.XPATH, JOB_LISTING_XPATH)
                     if job_index >= len(job_listings): break
                     job = job_listings[job_index]
                     job_index += 1
@@ -1199,6 +1461,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     print_lg("\n-@-\n")
 
                     job_id,title,company,work_location,work_style,skip = get_job_main_details(job, blacklisted_companies, rejected_jobs)
+                    publish_status(current_job=f"{title} | {company}")
                     
                     if skip: continue
                     # Redundant fail safe check for applied jobs!
@@ -1228,6 +1491,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         print_lg(e, 'Skipping this job!\n')
                         failed_job(job_id, job_link, resume, date_listed, "Found Blacklisted words in About Company", e, "Skipped", screenshot_name)
                         skip_count += 1
+                        publish_progress()
                         continue
                     except Exception as e:
                         logger.warning("Failed to scroll to About Company!")
@@ -1281,16 +1545,14 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                         failed_job(job_id, job_link, resume, date_listed, reason, message, "Skipped", screenshot_name)
                         rejected_jobs.add(job_id)
                         skip_count += 1
+                        publish_progress()
                         continue
 
                     
-                    if use_AI and description != "Unknown":
-                        try:
-                            skills = extract_skills(aiClient, description)
-                            print_lg(f"Extracted skills using {ai_provider} AI")
-                        except Exception as e:
-                            logger.warning("Failed to extract skills: %s", e)
-                            skills = "Error extracting skills"
+                    # Skill extraction is informational only. Calling Gemini for every
+                    # listing wastes quota and slows the application path; Gemini is
+                    # reserved for an otherwise-unanswerable required field or a
+                    # requested cover letter.
 
                     uploaded = False
                     # Is this an Easy Apply job? Try each locator in `easy_apply_locators` in
@@ -1311,7 +1573,12 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                 driver.switch_to.window(linkedIn_tab)
                                 print_lg(f"A new tab opened ({how}) - external application.")
                                 break
-                            find_by_class(driver, "jobs-easy-apply-modal", 3)
+                            try:
+                                find_by_class(driver, "jobs-easy-apply-modal", 3)
+                            except Exception:
+                                WebDriverWait(driver, 3).until(
+                                    EC.presence_of_element_located((By.XPATH, "//dialog[@open] | //*[@role='dialog']"))
+                                )
                             is_easy_apply = True
                             print_lg(f"Easy Apply detected ({how}).")
                             break
@@ -1327,8 +1594,21 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                             modal = driver
                             try:
                                 errored = ""
-                                modal = find_by_class(driver, "jobs-easy-apply-modal")
-                                wait_xp_click(modal, next_button_xpath, 1)
+                                try:
+                                    modal = find_by_class(driver, "jobs-easy-apply-modal")
+                                except Exception:
+                                    dialog = driver.find_element(By.XPATH, "//dialog[@open] | //*[@role='dialog']")
+                                    try:
+                                        modal = dialog.find_element(By.CSS_SELECTOR, "[data-testid='dialog-content']")
+                                    except Exception:
+                                        modal = dialog
+                                WebDriverWait(driver, 15).until(
+                                    EC.presence_of_element_located((By.XPATH, "//dialog[@open]//*[@data-testid='dialog-content'] | //dialog[@open]//*[@componentkey]"))
+                                )
+                                WebDriverWait(driver, 15).until(
+                                    EC.presence_of_element_located((By.XPATH, "//dialog[@open]//input | //dialog[@open]//select | //dialog[@open]//textarea"))
+                                )
+                                click_easy_apply_navigation(modal, next_button_xpath, 10)
                                 resume = "Previous resume"
                                 next_button = True
                                 questions_list = set()
@@ -1361,8 +1641,13 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                                     # (aria-label "View next page") and paged away mid-application.
                                     try: next_button = modal.find_element(By.XPATH, review_button_xpath)
                                     except NoSuchElementException:  next_button = modal.find_element(By.XPATH, next_button_xpath)
-                                    try: next_button.click()
-                                    except ElementClickInterceptedException: break    # Happens when it tries to click Next button in About Company photos section
+                                    try:
+                                        try:
+                                            next_button.click()
+                                        except ElementClickInterceptedException:
+                                            next_button.find_element(By.XPATH, ".//span[normalize-space()]").click()
+                                    except ElementClickInterceptedException:
+                                        break    # Happens when it tries to click Next button in About Company photos section
                                     buffer(click_gap)
 
                             except NoSuchElementException: errored = "nose"
@@ -1409,6 +1694,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                             # failed made a perfectly good stop_before_submit run read as 0/0/all-failed.
                             print_lg(str(e))
                             skip_count += 1
+                            publish_progress()
                             discard_job()
                             continue
 
@@ -1416,6 +1702,7 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                             print_lg(str(e))
                             print_lg("Add those answers to config/questions.py and re-run to apply to this job.")
                             skip_count += 1
+                            publish_progress(unresolved=len(unanswered_questions))
                             discard_job()
                             continue
 
@@ -1425,6 +1712,8 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                             critical_error_log("Somewhere in Easy Apply process",e)
                             failed_job(job_id, job_link, resume, date_listed, "Problem in Easy Applying", e, application_link, screenshot_name)
                             failed_count += 1
+                            publish_status(last_error=f"Easy Apply failed: {type(e).__name__}")
+                            publish_progress()
                             discard_job()
                             continue
                     else:
@@ -1443,6 +1732,8 @@ def apply_to_jobs(search_terms: list[str]) -> None:
                     if application_link == "Easy Applied": easy_applied_count += 1
                     else:   external_jobs_count += 1
                     applied_jobs.add(job_id)
+                    publish_progress()
+                    runtime_pause("after_apply")
 
 
 
@@ -1485,7 +1776,7 @@ def run(total_runs: int) -> int:
         sleep(300)
         print_lg("Few more min... Gonna start with in next 5 min...")
         sleep(300)
-    buffer(3)
+    runtime_pause("between_jobs")
     return total_runs + 1
 
 
@@ -1493,7 +1784,8 @@ def run(total_runs: int) -> int:
 linkedIn_tab = False
 
 def main() -> None:
-    pyautogui.alert("Please consider sponsoring this project at:\n\nhttps://github.com/sponsors/GodsScion\n\n", "Support the project", "Okay")
+    if interactive_session:
+        pyautogui.alert("Please consider sponsoring this project at:\n\nhttps://github.com/sponsors/GodsScion\n\n", "Support the project", "Okay")
     total_runs = 1
     try:
         global linkedIn_tab, tabs_count, useNewResume, aiClient
@@ -1506,8 +1798,13 @@ def main() -> None:
         
         # Login to LinkedIn
         tabs_count = len(driver.window_handles)
-        driver.get("https://www.linkedin.com/login")
-        if not is_logged_in_LN(): login_LN()
+        driver.get("https://www.linkedin.com/feed")
+        sleep(3)
+        if not is_logged_in_LN():
+            driver.get("https://www.linkedin.com/login")
+            login_LN()
+        else:
+            print_lg("Already logged in via session cookie! Skipping login screen.")
         
         linkedIn_tab = driver.current_window_handle
 

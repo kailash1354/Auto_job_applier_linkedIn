@@ -295,7 +295,7 @@ def test_discard_job_uses_the_close_button_then_the_confirmation(bot, monkeypatc
 
     bot.discard_job()
 
-    assert clicked == [".//button[@data-test-modal-close-btn]", bot.discard_button_xpath]
+    assert clicked == ["//button[@data-test-modal-close-btn]", bot.discard_button_xpath]
 
 
 def test_discard_job_falls_back_to_escape_when_the_modal_survives(bot, monkeypatch):

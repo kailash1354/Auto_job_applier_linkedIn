@@ -31,13 +31,22 @@ import signal
 import subprocess
 import threading
 import importlib
+import secrets
 
 import config_schema
 from config import _overrides
 from modules import updater
+from modules import runtime_control
 
 app = Flask(__name__)
-CORS(app)
+# The control center is injected into LinkedIn, so only that origin may read the
+# run-time endpoints cross-origin. The full localhost panel remains same-origin.
+CORS(app, resources={
+    r"/api/(runtime|copilot|logs|analytics)": {
+        "origins": ["https://www.linkedin.com", "https://linkedin.com"],
+        "allow_headers": ["Content-Type", "X-Bot-Control-Token"],
+    },
+})
 
 # Project root is the folder this file lives in.
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +55,7 @@ LOG_PATH = os.path.join(ROOT, ".bot_run.log")
 PID_PATH = os.path.join(ROOT, ".bot_run.pid")
 
 PATH = 'all excels/'
+LOCAL_ORIGIN = "http://127.0.0.1:5001"
 
 
 # ===========================================================================
@@ -407,10 +417,13 @@ def api_run():
         try:
             # Truncate the log at the start of each run.
             log_file = open(LOG_PATH, "w", encoding="utf-8")
+            token = secrets.token_urlsafe(24)
+            runtime_control.start_run(token)
             popen_kwargs = {
                 "cwd": ROOT,
                 "stdout": log_file,
                 "stderr": subprocess.STDOUT,
+                "env": {**os.environ, "BOT_CONTROL_TOKEN": token},
             }
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -436,6 +449,7 @@ def api_stop():
             _terminate(_bot_proc)
             _bot_proc = None
         _remove_pid_file()
+        runtime_control.update_state(stop=True, paused=False, status="stopped")
         return jsonify({"running": False})
 
 
@@ -445,7 +459,155 @@ def api_status():
     with _bot_lock:
         running = _is_running()
         pid = _bot_proc.pid if (running and _bot_proc is not None) else None
-        return jsonify({"running": running, "pid": pid})
+        runtime = runtime_control.read_state()
+        runtime.pop("token", None)
+        return jsonify({"running": running, "pid": pid, "runtime": runtime})
+
+
+def _runtime_response(state):
+    safe = copy.deepcopy(state)
+    safe.pop("token", None)
+    return jsonify(safe)
+
+
+def _control_request_authorized(state) -> bool:
+    """Allow the same-origin panel or the active, token-bearing injected UI."""
+    token = state.get("token", "")
+    if not token:
+        return True
+    supplied = request.headers.get("X-Bot-Control-Token", "")
+    if supplied and secrets.compare_digest(supplied, token):
+        return True
+    return request.headers.get("Origin", "") == LOCAL_ORIGIN
+
+
+@app.route('/api/runtime', methods=['GET'])
+def api_runtime_get():
+    """Return synchronized, non-secret bot state for the panel and bubble."""
+    return _runtime_response(runtime_control.read_state())
+
+
+@app.route('/api/runtime', methods=['POST'])
+def api_runtime_update():
+    """Update transient controls; persistent config remains owned by /api/config."""
+    state = runtime_control.read_state()
+    if not _control_request_authorized(state):
+        return jsonify({"error": "Invalid bot control token"}), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+    allowed = {"paused", "stop", "refresh", "status", "current_job", "last_error"}
+    changes = {key: value for key, value in payload.items() if key in allowed}
+    if "settings" in payload:
+        settings = payload["settings"]
+        if not isinstance(settings, dict):
+            return jsonify({"error": "settings must be an object"}), 400
+        allowed_settings = {"search_term", "location", "easy_apply_only", "timing_profile", "use_ai"}
+        changes["settings"] = {key: value for key, value in settings.items() if key in allowed_settings}
+    if not changes:
+        return jsonify({"error": "No supported runtime changes supplied"}), 400
+    return _runtime_response(runtime_control.update_state(**changes))
+
+
+def _history_rows():
+    """Read the existing application history once for history and analytics APIs."""
+    csv_path = os.path.join(PATH, _HISTORY_CSV)
+    if not os.path.exists(csv_path):
+        return []
+    try:
+        with open(csv_path, "r", encoding="utf-8") as handle:
+            return list(csv.DictReader(handle))
+    except OSError:
+        return []
+
+
+@app.route('/api/analytics', methods=['GET'])
+def api_analytics():
+    """Small dashboard summary derived from the existing history CSV and runtime."""
+    rows = _history_rows()
+    easy = sum(row.get('External Job link') == 'Easy Applied' for row in rows)
+    pending = sum(row.get('Date Applied') in ('', 'Pending') for row in rows)
+    runtime = runtime_control.read_state()
+    return jsonify({
+        "total": len(rows), "easy_applied": easy, "pending": pending,
+        "external": max(0, len(rows) - easy),
+        "runtime": {"progress": runtime.get("progress", {}), "status": runtime.get("status", "idle")},
+    })
+
+
+def _copilot_command(message: str, state: dict) -> tuple[str | None, dict, str | None]:
+    """Execute a small, auditable command language before asking an AI provider."""
+    import re
+    text = " ".join(message.lower().strip().split())
+    changes, open_tab = {}, None
+    if text in {"pause", "pause bot"}:
+        changes = {"paused": True}; return "Bot paused.", changes, None
+    if text in {"resume", "resume bot", "continue"}:
+        changes = {"paused": False, "refresh": False}; return "Bot resumed.", changes, None
+    if text in {"stop", "stop bot"}:
+        changes = {"stop": True, "paused": False}; return "Stop requested.", changes, None
+    if "refresh" in text or "rerun search" in text:
+        changes = {"paused": True, "refresh": True}; return "Search refresh queued; resume when ready.", changes, None
+    if text in {"show logs", "logs"}:
+        return "Open the Data tab for the live log, or the full Run panel for the complete log.", {}, "Run"
+    if text in {"history", "show history", "analytics", "show analytics"}:
+        return "Opening application history and analytics.", {}, "Run"
+    tab_names = {"account": "Account", "profile": "Profile", "resume": "Profile", "resumes": "Profile", "ai": "Account", "provider": "Account", "search": "Search", "filters": "Filters", "settings": "Run settings"}
+    for word, tab in tab_names.items():
+        if text in {f"open {word}", word}:
+            return f"Opening {tab} settings.", {}, tab
+    match = re.fullmatch(r"(?:search|find)\s+(.+?)(?:\s+in\s+(.+))?", text)
+    if match:
+        term, location = match.groups()
+        settings = {"search_term": term.strip()}
+        if location: settings["location"] = location.strip()
+        return "Search change queued. It will apply on refresh/resume.", {"paused": True, "refresh": True, "settings": settings}, None
+    match = re.fullmatch(r"(?:location|set location to)\s+(.+)", text)
+    if match:
+        return "Location change queued. Refresh search when ready.", {"settings": {"location": match.group(1).strip()}}, None
+    if "why" in text and ("skip" in text or "skipped" in text):
+        reason = state.get("last_error") or "No specific skip reason was published for the latest job. Open Data for the detailed log."
+        return reason, {}, "Run"
+    return None, {}, None
+
+
+@app.route('/api/copilot', methods=['POST'])
+def api_copilot():
+    """Handle real control commands, then use the configured AI provider for guidance."""
+    state = runtime_control.read_state()
+    if not _control_request_authorized(state):
+        return jsonify({"error": "Invalid bot control token"}), 403
+    payload = request.get_json(silent=True) or {}
+    message = str(payload.get("message", "")).strip()
+    if not message or len(message) > 2000:
+        return jsonify({"error": "message must contain 1-2000 characters"}), 400
+    reply, changes, open_tab = _copilot_command(message, state)
+    if changes:
+        state = runtime_control.update_state(**changes)
+    if reply is None:
+        try:
+            from config import secrets as cfg
+            from modules.ai.connections import create_ai_client
+            if not cfg.use_AI:
+                reply = "AI is disabled. I can still control the bot and open settings."
+            else:
+                client = create_ai_client()
+                if not client:
+                    reply = "The configured AI provider is unavailable. Check Account settings."
+                else:
+                    prompt = ("You are the local LinkedIn Job Applier copilot. Give concise, factual help about the bot's "
+                              "current state. Do not claim you changed anything unless the command endpoint already did. "
+                              f"Runtime: {json.dumps(_runtime_response_data(state))}. User: {message}")
+                    reply = str(client.model.invoke(prompt).content).strip()
+        except Exception as error:
+            reply = f"Configured AI is unavailable ({type(error).__name__}). Use the explicit controls or check Account settings."
+    return jsonify({"reply": reply, "runtime": _runtime_response_data(state), "open_tab": open_tab})
+
+
+def _runtime_response_data(state):
+    safe = copy.deepcopy(state)
+    safe.pop("token", None)
+    return safe
 
 
 @app.route('/api/logs', methods=['GET'])
@@ -528,7 +690,7 @@ def api_update():
     return jsonify(updater.self_update())
 
 
-def _resolve_port(preferred: int = 5000) -> int:
+def _resolve_port(preferred: int = 5001) -> int:
     '''
     Pick a port to serve on. Honors the PORT environment variable (the launcher
     scripts set it). Otherwise tries `preferred`, and if that's taken - e.g. port
@@ -552,7 +714,7 @@ def _resolve_port(preferred: int = 5000) -> int:
 
 if __name__ == '__main__':
     # SECURITY: localhost only, debug OFF. This app handles credentials.
-    port = _resolve_port(5000)
+    port = _resolve_port(5001)
     url = "http://127.0.0.1:%d" % port
     print(
         "\n  Control panel ready at:  %s\n"
