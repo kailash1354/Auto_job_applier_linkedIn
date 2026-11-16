@@ -24,7 +24,7 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from modules.helpers import find_default_profile_directory, critical_error_log, logger, print_lg
-from selenium.common.exceptions import SessionNotCreatedException
+from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
 
 
 AUTOMATION_PROFILE_ROOT = os.path.join(
@@ -132,8 +132,28 @@ def should_use_undetected_driver(is_real_profile: bool) -> bool:
     return not is_real_profile
 
 
+def attach_to_existing_chrome(debugger_address: str):
+    """Attach to a user-launched Chrome session; never create an automation login browser."""
+    options = Options()
+    options.debugger_address = debugger_address
+    try:
+        driver = webdriver.Chrome(options=options)
+    except WebDriverException as exc:
+        raise RuntimeError(
+            f"Could not attach to the real Chrome session at {debugger_address}. "
+            "Start Chrome with remote debugging while signed in first."
+        ) from exc
+    driver.maximize_window()
+    return options, driver, ActionChains(driver), WebDriverWait(driver, 10)
+
+
 def createChromeSession():
     make_directories([file_name, failed_file_name, logs_folder_path+"/screenshots", default_resume_path, generated_resume_path+"/temp"])
+
+    if os.environ.get("BOT_ATTACH_TO_CHROME", "").strip().lower() in ("1", "true", "yes"):
+        debugger_address = os.environ.get("BOT_CHROME_DEBUGGER_ADDRESS", "127.0.0.1:9222")
+        print_lg(f"Attaching to user-launched Chrome at {debugger_address}...")
+        return attach_to_existing_chrome(debugger_address)
 
     if sys.platform == "darwin":
         try:

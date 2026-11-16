@@ -423,7 +423,11 @@ def api_run():
                 "cwd": ROOT,
                 "stdout": log_file,
                 "stderr": subprocess.STDOUT,
-                "env": {**os.environ, "BOT_CONTROL_TOKEN": token},
+                "env": {
+                    **os.environ,
+                    "BOT_CONTROL_TOKEN": token,
+                    "BOT_ATTACH_TO_CHROME": "1",
+                },
             }
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
