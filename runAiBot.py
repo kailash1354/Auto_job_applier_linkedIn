@@ -1785,7 +1785,15 @@ linkedIn_tab = False
 
 def main() -> None:
     if interactive_session:
-        pyautogui.alert("Please consider sponsoring this project at:\n\nhttps://github.com/sponsors/GodsScion\n\n", "Support the project", "Okay")
+        try:
+            pyautogui.alert(
+                "Please consider sponsoring this project at:\n\n"
+                "https://github.com/sponsors/GodsScion\n\n",
+                "Support the project",
+                "Okay",
+            )
+        except (AssertionError, RuntimeError, ImportError, OSError) as exc:
+            logger.info("Optional sponsorship dialog unavailable: %s", type(exc).__name__)
     total_runs = 1
     try:
         global linkedIn_tab, tabs_count, useNewResume, aiClient

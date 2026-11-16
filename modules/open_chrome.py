@@ -97,17 +97,34 @@ def get_chrome_profile() -> tuple[str, bool]:
     if safe_mode:
         return get_default_temp_profile(), False
     source_root = find_default_profile_directory()
-    if source_root:
+    if not source_root:
+        logger.warning("Installed Chrome user-data directory was not found; using the existing bot profile")
+        os.makedirs(AUTOMATION_PROFILE_ROOT, exist_ok=True)
+        return AUTOMATION_PROFILE_ROOT, False
+    try:
+        from config.secrets import username
+    except ImportError:
+        username = ""
+    profile_name = get_profile_directory_name(source_root, username)
+    if not profile_name and not os.path.exists(os.path.join(source_root, "Local State")):
+        profile_name = "Default"
+    if not profile_name:
+        raise RuntimeError(
+            f"Could not identify the Chrome profile for {username!r}; "
+            "the bot will not launch an anonymous profile"
+        )
+    try:
+        ensure_automation_profile(source_root, profile_name, AUTOMATION_PROFILE_ROOT)
+    except (OSError, shutil.Error) as exc:
+        raise RuntimeError(
+            f"Could not clone the signed-in Chrome profile {profile_name!r}: "
+            f"{type(exc).__name__}"
+        ) from exc
+    for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         try:
-            from config.secrets import username
-        except ImportError:
-            username = ""
-        profile_name = get_profile_directory_name(source_root, username) or "Default"
-        try:
-            ensure_automation_profile(source_root, profile_name, AUTOMATION_PROFILE_ROOT)
-        except (OSError, shutil.Error):
+            os.remove(os.path.join(AUTOMATION_PROFILE_ROOT, lock_name))
+        except FileNotFoundError:
             pass
-    os.makedirs(AUTOMATION_PROFILE_ROOT, exist_ok=True)
     return AUTOMATION_PROFILE_ROOT, False
 
 
@@ -136,21 +153,9 @@ def createChromeSession():
     options.add_experimental_option("useAutomationExtension", False)
 
     print_lg("Opening standard Chrome browser...")
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    persistent_profile = os.path.join(project_root, "chrome_profile")
-    os.makedirs(persistent_profile, exist_ok=True)
-
-    if safe_mode:
-        print_lg("Using guest profile...")
-        options.add_argument(f"--user-data-dir={get_default_temp_profile()}")
-    else:
-        for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-            try:
-                lock_path = os.path.join(persistent_profile, lock_name)
-                if os.path.exists(lock_path): os.remove(lock_path)
-            except: pass
-        options.add_argument(f"--user-data-dir={persistent_profile}")
-        print_lg(f"Using persistent profile: {persistent_profile}")
+    persistent_profile, _ = get_chrome_profile()
+    options.add_argument(f"--user-data-dir={persistent_profile}")
+    print_lg(f"Using authenticated Chrome profile copy: {persistent_profile}")
 
     driver = webdriver.Chrome(options=options)
     driver.maximize_window()
